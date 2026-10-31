@@ -58,6 +58,18 @@
   </div>
   <p class="hint">Enable / Disable changes only the protection switch. Set protection current changes only the current threshold. Both operations broadcast to every servo; no scan or ID selection is needed. Overheat protection stays enabled, and stored voltage limits are unchanged. Current resolution is 6.5 mA. Broadcast writes have no per-servo acknowledgement.</p>
 </section>
+<section class="servo-panel">
+  <h2>手动读取电压</h2>
+  <div class="servo-row" style="display:flex;flex-wrap:wrap">
+    <label for="voltage-servo-id">舵机 ID</label>
+    <input id="voltage-servo-id" type="number" min="0" max="253" step="1" value="32" aria-label="电压读取舵机 ID">
+    <strong id="supply-voltage" class="servo-readout">—</strong>
+    <button id="read-voltage" type="button" disabled>读取电压</button>
+    <span id="supply-voltage-detail" role="status">尚未读取</span>
+  </div>
+  <p class="hint">ID 默认为 32，可选 0–253。点击后读取一次所选舵机的供电电压，不自动采样；无需扫描或使能舵机。显示值为舵机端电压。</p>
+</section>
 </main>
-<script src="servo.js?v=20261021-3"></script>
+<script src="voltage.js?v=20261031-select-voltage"></script>
+<script src="servo.js?v=20261031-select-voltage"></script>
 </html>

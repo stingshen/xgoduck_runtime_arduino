@@ -1,4 +1,5 @@
 """100Hz receive/filter callback and independent 50Hz ONNX loop."""
+import secrets
 import collections
 import math
 import threading
@@ -91,6 +92,14 @@ class Controller:
         self._imu_source_us = None
         self._imu_source_time = 0.0
         self.diagnostics = {}
+        self.voltage_values = [None] * 15
+        self.voltage_servo_id = VOLTAGE_SERVO_ID
+        self.voltage_value = None
+        self.voltage_rx_time = 0.0
+        self.voltage_request_seq = secrets.randbits(16)
+        self.voltage_pending = None
+        self.voltage_requested_at = float('-inf')
+        self.voltage_error = ''
         self.mode = 'shadow'
         self.generation = 0
         self.twist, self.head, self.mouth = [0.0]*3, [0.0]*4, 0.0
@@ -154,8 +163,84 @@ class Controller:
         with self.lock:
             if self.servo_expected_reply != (pkt['op'], pkt['target_id']):
                 return
+            if pkt['op'] == SERVO_READ_BYTE and (
+                    pkt['request_id'] != self.voltage_pending or pkt['address'] != VOLTAGE_ADDRESS):
+                return
             self.servo_reply = pkt
             self.servo_reply_event.set()
+
+    def _expire_voltage_locked(self, now):
+        if self.voltage_pending is not None and now - self.voltage_requested_at > VOLTAGE_REQUEST_TIMEOUT_S:
+            self.voltage_pending = None
+            self.voltage_values = [None] * 15
+            self.voltage_value = None
+            self.voltage_error = '读取超时，请重试'
+
+    def request_voltage(self, servo_id=VOLTAGE_SERVO_ID):
+        if type(servo_id) is not int or not 0 <= servo_id <= 253:
+            raise ValueError('舵机 ID 必须是 0–253 的整数')
+        with self.lock:
+            self._expire_voltage_locked(time.monotonic())
+            if self.voltage_pending is not None:
+                if servo_id != self.voltage_servo_id:
+                    raise ValueError('已有电压读取请求，请等待完成')
+                return {'accepted': False, 'pending': True, 'request_id': self.voltage_pending}
+        # Share the master branch's serialized servo-operation/reply mechanism.
+        if not self.servo_op_lock.acquire(blocking=False):
+            raise ValueError('舵机操作进行中，请稍后读取')
+        request_id = None
+        try:
+            with self.lock:
+                now = time.monotonic()
+                if now - self.voltage_requested_at < VOLTAGE_MIN_INTERVAL_S:
+                    raise ValueError('请间隔至少 1 秒再读取')
+                if not self.feedback or now - self.rx_time > 0.15:
+                    raise ValueError('机器人未连接，无法读取电压')
+                if self.mode == 'calibrate':
+                    raise ValueError('校准期间无法读取电压')
+                self.voltage_request_seq = (self.voltage_request_seq + 1) & 0xffff or 1
+                request_id = self.voltage_request_seq
+                self.voltage_servo_id = servo_id
+                self.voltage_pending = request_id
+                self.voltage_requested_at = now
+                self.voltage_values = [None] * 15
+                self.voltage_value = None
+                self.voltage_rx_time = 0.0
+                self.voltage_error = ''
+                self.servo_reply_event.clear()
+                self.servo_reply = None
+                self.servo_expected_reply = (SERVO_READ_BYTE, servo_id)
+            try:
+                self.bridge.notify('duck_servo', encode_servo_read_byte(request_id, servo_id, VOLTAGE_ADDRESS))
+            except Exception as exc:
+                raise ValueError('读取请求发送失败') from exc
+            try:
+                reply = self._wait_servo_reply(SERVO_READ_BYTE, VOLTAGE_REQUEST_TIMEOUT_S, servo_id)
+            except ValueError as exc:
+                message = '读取超时，请重试' if 'timeout' in str(exc) else f'{servo_id} 号舵机未返回有效电压'
+                raise ValueError(message) from exc
+            with self.lock:
+                # status() can expire a request while the API thread is waiting.
+                if self.voltage_pending != request_id:
+                    raise ValueError('读取超时，请重试')
+                raw = reply['value']
+                volts = raw / 10.0 if 0 < raw < 255 else None
+                self.voltage_value = volts
+                self.voltage_values = [volts if sid == servo_id else None for sid in MOTOR_IDS]
+                self.voltage_rx_time = time.monotonic()
+                self.voltage_error = '' if volts is not None else f'{servo_id} 号舵机未返回有效电压'
+            return {'accepted': True, 'pending': False, 'request_id': request_id}
+        except ValueError as exc:
+            if request_id is not None:
+                with self.lock:
+                    self.voltage_error = str(exc)
+            raise
+        finally:
+            if request_id is not None:
+                with self.lock:
+                    self.voltage_pending = None
+                    self.servo_expected_reply = None
+            self.servo_op_lock.release()
 
     def receive_diagnostics(self, raw):
         try:
@@ -892,6 +977,17 @@ class Controller:
                 gravity_tau_s=self.filter.gravity_tau_s, imu_bias_deg=list(IMU_BIAS_DEG),
                 filter_clock='mcu_imu', snapshot='latest',
                 command_timeout_enabled=False, imu_stale_ms=IMU_STALE_S*1000)
+            age = now - self.voltage_rx_time if self.voltage_rx_time else None
+            self._expire_voltage_locked(now)
+            values = list(self.voltage_values)
+            volts = self.voltage_value
+            result['supply_voltage'] = dict(volts=volts, min_volts=volts,
+                max_volts=volts, per_servo=values, valid_count=int(volts is not None),
+                age_ms=age * 1000 if age is not None else None, source='servo_bus',
+                servo_id=self.voltage_servo_id, available=volts is not None,
+                pending=self.voltage_pending is not None, error=self.voltage_error,
+                connected=bool(fb and now - self.rx_time <= 0.15),
+                retry_after_ms=max(0, (VOLTAGE_MIN_INTERVAL_S - (now-self.voltage_requested_at))*1000))
             result['mcu_runtime'] = dict(self.diagnostics)
             if self.diagnostics.get('imu_period_us'):
                 result['mcu_runtime']['imu_hz'] = 1e6/self.diagnostics['imu_period_us']
